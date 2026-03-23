@@ -95,8 +95,12 @@ export class SceneManager {
         this.highlightManager = new HighlightManager(this);
         this.measurementManager = new MeasurementManager(this);
 
-        // Current model
+        // Current model (UI focus: joints, graph, editor)
         this.currentModel = null;
+        /** @type {{ model: import('../models/UnifiedRobotModel.js').UnifiedRobotModel, sceneKey: string|null }[]} */
+        this.loadedRobotModels = [];
+        /** Single mesh preview (replaces robots; not in loadedRobotModels) */
+        this.meshOnlyModel = null;
         this.ignoreLimits = false;
 
         // Drag controls
@@ -169,10 +173,106 @@ export class SceneManager {
 
     // ==================== Model Management ====================
 
-    addModel(model) {
-        // Clear previous model
-        if (this.currentModel && this.currentModel.threeObject) {
-            this.removeModel(this.currentModel);
+    /**
+     * Prefix for axis map keys (avoids duplicate link/joint names across instances)
+     */
+    makeAxisInstancePrefix(sceneKey) {
+        if (!sceneKey) return '';
+        return String(sceneKey).replace(/\\/g, '/').replace(/\//g, '_') + '::';
+    }
+
+    getRobotModelsForDrag() {
+        return this.loadedRobotModels.map((e) => e.model).filter((m) => m?.threeObject);
+    }
+
+    /**
+     * Remove all robot instances from the scene (keeps grid/lights)
+     */
+    clearAllRobotModels() {
+        while (this.loadedRobotModels.length > 0) {
+            this.removeModel(this.loadedRobotModels[0].model);
+        }
+    }
+
+    /**
+     * Switch UI/drag focus without moving objects
+     */
+    setActiveModel(model, sceneKey = null) {
+        if (!model) return;
+        this.currentModel = model;
+        if (!model.userData) model.userData = {};
+        if (sceneKey) model.userData.sceneKey = sceneKey;
+        this.initDragControls(this.getRobotModelsForDrag());
+        this.setIgnoreLimits(this.ignoreLimits);
+    }
+
+    /**
+     * @param {import('../models/UnifiedRobotModel.js').UnifiedRobotModel} model
+     * @param {{ replace?: boolean, sceneKey?: string|null }} [options]
+     */
+    addModel(model, options = {}) {
+        const { replace = false, sceneKey = null } = options;
+
+        if (!model.userData) model.userData = {};
+        if (sceneKey) model.userData.sceneKey = sceneKey;
+        const axisPrefix = this.makeAxisInstancePrefix(sceneKey);
+        model.userData.axisInstancePrefix = axisPrefix;
+
+        const isSingleMesh = !model.joints || model.joints.size === 0;
+
+        if (isSingleMesh) {
+            this.clearAllRobotModels();
+            if (this.meshOnlyModel?.threeObject?.parent) {
+                this.meshOnlyModel.threeObject.parent.remove(this.meshOnlyModel.threeObject);
+            }
+            this.meshOnlyModel = model;
+            this.currentModel = model;
+
+            if (!model.threeObject) {
+                return;
+            }
+
+            this.scene.add(model.threeObject);
+            this.visualizationManager.extractVisualAndCollision(model);
+
+            let modelSize = 1.0;
+            try {
+                model.threeObject.updateMatrixWorld(true);
+                const bbox = new THREE.Box3().setFromObject(model.threeObject);
+                if (!bbox.isEmpty()) {
+                    const size = bbox.getSize(new THREE.Vector3());
+                    modelSize = Math.max(size.x, size.y, size.z);
+                }
+            } catch (e) { /* ignore */ }
+
+            this.axesManager.clearAllLinkAxes();
+            if (model.links) {
+                model.links.forEach((link, linkName) => {
+                    this.axesManager.createLinkAxes(link, linkName, modelSize, '');
+                });
+            }
+            this.axesManager.clearAllJointAxes();
+
+            this.inertialVisualization.extractInertialProperties(model);
+            this.initDragControls(this.meshOnlyModel ? [this.meshOnlyModel] : []);
+
+            this.updateEnvironment(false);
+            requestAnimationFrame(() => {
+                requestAnimationFrame(() => {
+                    this.updateEnvironment(true);
+                    this.emit('modelReady', model);
+                });
+            });
+            return;
+        }
+
+        if (this.meshOnlyModel?.threeObject?.parent) {
+            this.meshOnlyModel.threeObject.parent.remove(this.meshOnlyModel.threeObject);
+            this.meshOnlyModel = null;
+        }
+
+        if (replace) {
+            this.clearAllRobotModels();
         }
 
         this.currentModel = model;
@@ -181,38 +281,24 @@ export class SceneManager {
             return;
         }
 
-        // Check if single mesh model (no joints)
-        const isSingleMesh = !model.joints || model.joints.size === 0;
-
-        if (isSingleMesh) {
-            // Single mesh file: add directly to scene, no world rotation
-            // DAE file's ColladaLoader already handles Z-up to Y-up conversion
-            this.scene.add(model.threeObject);
-        } else {
-            // Complete robot model (URDF/MJCF/USD): use world object for coordinate system conversion
-            // Ensure world object exists (default +Z coordinate system)
-            if (!this.world) {
-                this.world = new THREE.Object3D();
-                this.scene.add(this.world);
-                // Default set to +Z coordinate system
-                this.world.rotation.set(-Math.PI / 2, 0, 0);
-            }
-
-            // Add model to world
-            this.world.add(model.threeObject);
-
-            // Read and apply current coordinate system setting
-            const upSelect = document.getElementById('up-select');
-            if (upSelect) {
-                this.setUp(upSelect.value || '+Z');
-            }
+        if (!this.world) {
+            this.world = new THREE.Object3D();
+            this.scene.add(this.world);
+            this.world.rotation.set(-Math.PI / 2, 0, 0);
         }
 
-        // Extract visual and collision bodies
+        this.world.add(model.threeObject);
+
+        const upSelect = document.getElementById('up-select');
+        if (upSelect) {
+            this.setUp(upSelect.value || '+Z');
+        }
+
+        this.axesManager.removeInstanceAxes(axisPrefix);
+
         this.visualizationManager.extractVisualAndCollision(model);
 
-        // Calculate model size for dynamic axis adjustment
-        let modelSize = 1.0; // Default value
+        let modelSize = 1.0;
         try {
             if (model.threeObject) {
                 model.threeObject.updateMatrixWorld(true);
@@ -226,93 +312,105 @@ export class SceneManager {
             // Failed to calculate model size, using default
         }
 
-        // Create local coordinate system for each link (pass model size)
-        this.axesManager.clearAllLinkAxes();
         if (model.links) {
             model.links.forEach((link, linkName) => {
-                this.axesManager.createLinkAxes(link, linkName, modelSize);
+                this.axesManager.createLinkAxes(link, linkName, modelSize, axisPrefix);
             });
         }
 
-        // Create rotation axes for each revolute joint
-        this.axesManager.clearAllJointAxes();
         if (model.joints) {
-            let rotaryJointCount = 0;
             model.joints.forEach((joint, jointName) => {
-                if (this.axesManager.createJointAxis(joint, jointName)) {
-                    rotaryJointCount++;
-                }
+                this.axesManager.createJointAxis(joint, jointName, axisPrefix);
             });
         }
 
-        // Extract COM and inertia information
         this.inertialVisualization.extractInertialProperties(model);
 
-        // Visualize parallel mechanism constraints
         this.constraintManager.visualizeConstraints(model, this.world);
 
-        // Apply constraints on initialization to ensure initial state satisfies constraints
         if (model.constraints && model.constraints.size > 0) {
             this.constraintManager.applyConstraints(model, null);
         }
 
-        // Initialize drag controls
-        this.initDragControls(model);
+        const idx = this.loadedRobotModels.findIndex((e) => e.sceneKey === sceneKey && sceneKey);
+        if (idx >= 0) {
+            this.loadedRobotModels[idx] = { model, sceneKey };
+        } else {
+            this.loadedRobotModels.push({ model, sceneKey });
+        }
 
-        // Update environment (adjust ground position and shadows, but not camera)
-        // Don't adjust camera on first time, wait for mesh to load completely
+        this.initDragControls(this.getRobotModelsForDrag());
+
         this.updateEnvironment(false);
 
-        if (isSingleMesh) {
-            // Single mesh: synchronous loading, delay camera adjustment to keep snapshot occlusion
-            // Use requestAnimationFrame to ensure rendering completes
-            requestAnimationFrame(() => {
-                requestAnimationFrame(() => {
-                    this.updateEnvironment(true);
+        setTimeout(() => {
+            this.visualizationManager.extractVisualAndCollision(model);
+        }, 100);
 
-                    // Trigger model ready event
-                    this.emit('modelReady', model);
-                });
-            });
-        } else {
-            // URDF/MJCF model: mesh files are loaded asynchronously, need to delay
-            // Multiple extractions to catch meshes loaded at different times
-            setTimeout(() => {
-                this.visualizationManager.extractVisualAndCollision(model);
-            }, 100);
+        setTimeout(() => {
+            this.visualizationManager.extractVisualAndCollision(model);
+            this.updateEnvironment(true);
+            this.emit('modelReady', model);
+        }, 1000);
 
-            setTimeout(() => {
-                this.visualizationManager.extractVisualAndCollision(model);
-                this.updateEnvironment(true);
-                this.emit('modelReady', model);
-            }, 1000);
-
-            setTimeout(() => {
-                this.visualizationManager.extractVisualAndCollision(model);
-            }, 2500);
-        }
+        setTimeout(() => {
+            this.visualizationManager.extractVisualAndCollision(model);
+        }, 2500);
     }
 
     removeModel(model) {
-        if (model && model.threeObject && model.threeObject.parent) {
+        if (!model) return;
+
+        if (this.meshOnlyModel === model) {
+            if (model.threeObject?.parent) {
+                model.threeObject.parent.remove(model.threeObject);
+            }
+            this.visualizationManager.removeModelResources(model);
+            this.axesManager.clear();
+            this.inertialVisualization.removeModelInertial(model);
+            this.meshOnlyModel = null;
+            if (this.currentModel === model) {
+                this.currentModel = null;
+            }
+            if (this.dragControls) {
+                this.dragControls.dispose();
+                this.dragControls = null;
+            }
+            this.measurementManager.clear();
+            this.highlightManager.clearHighlight();
+            return;
+        }
+
+        const idx = this.loadedRobotModels.findIndex((e) => e.model === model);
+        if (idx < 0) {
+            return;
+        }
+
+        if (model.threeObject?.parent) {
             model.threeObject.parent.remove(model.threeObject);
         }
 
-        // Clear all managers
-        this.axesManager.clear();
-        this.visualizationManager.clear();
-        this.inertialVisualization.clear();
-        this.constraintManager.clear();
+        this.visualizationManager.removeModelResources(model);
+        this.axesManager.removeInstanceAxes(model.userData?.axisInstancePrefix || '');
+        this.inertialVisualization.removeModelInertial(model);
+        this.constraintManager.removeConstraintsForModel(model);
         this.measurementManager.clear();
         this.highlightManager.clearHighlight();
 
-        // Clear drag controls
+        this.loadedRobotModels.splice(idx, 1);
+
+        if (this.currentModel === model) {
+            this.currentModel = this.loadedRobotModels[0]?.model || null;
+        }
+
         if (this.dragControls) {
             this.dragControls.dispose();
             this.dragControls = null;
         }
-
-        this.currentModel = null;
+        const dragList = this.getRobotModelsForDrag();
+        if (dragList.length > 0) {
+            this.initDragControls(dragList);
+        }
     }
 
     // ==================== Environment & Camera ====================
@@ -323,23 +421,36 @@ export class SceneManager {
      * @param {boolean} fitCamera - Whether to auto-adjust camera view (default false)
      */
     updateEnvironment(fitCamera = false) {
-        const model = this.currentModel;
-        if (!model || !model.threeObject) {
+        const roots = [];
+        this.loadedRobotModels.forEach(({ model: m }) => {
+            if (m?.threeObject) roots.push(m.threeObject);
+        });
+        if (this.meshOnlyModel?.threeObject) {
+            roots.push(this.meshOnlyModel.threeObject);
+        }
+        if (roots.length === 0) {
             return;
         }
 
-        // Force update world matrix (including all children)
-        // For single mesh, might not have world object
         if (this.world) {
             this.world.updateMatrixWorld(true);
         }
-        model.threeObject.updateMatrixWorld(true);
 
-        // Directly calculate entire model's bounding box in scene global coordinate system
         const bboxGlobal = new THREE.Box3();
-        bboxGlobal.setFromObject(model.threeObject, true);
+        let first = true;
+        roots.forEach((root) => {
+            root.updateMatrixWorld(true);
+            const b = new THREE.Box3().setFromObject(root, true);
+            if (b.isEmpty()) return;
+            if (first) {
+                bboxGlobal.copy(b);
+                first = false;
+            } else {
+                bboxGlobal.union(b);
+            }
+        });
 
-        if (bboxGlobal.isEmpty()) {
+        if (first || bboxGlobal.isEmpty()) {
             return;
         }
 
@@ -532,48 +643,48 @@ export class SceneManager {
 
     // ==================== Drag Controls ====================
 
-    initDragControls(model) {
+    initDragControls(models) {
         if (this.dragControls) {
             this.dragControls.dispose();
         }
+
+        const list = Array.isArray(models) ? models.filter(Boolean) : (models ? [models] : []);
 
         this.dragControls = new PointerJointDragControls(
             this.scene,
             this.camera,
             this.canvas,
-            model
+            list
         );
+
+        if (list.length > 0) {
+            this.dragControls.model = list[0];
+        }
 
         // Pass renderer reference for rendering during drag
         this.dragControls.renderer = this.renderer;
 
-        // Pass ignoreLimits flag to model's userData (need to set in two locations)
-        if (model) {
-            // Set on model object itself
+        list.forEach((model) => {
+            if (!model) return;
             if (!model.userData) {
                 model.userData = {};
             }
             model.userData.ignoreLimits = this.ignoreLimits;
-
-            // Set on model's threeObject
             if (model.threeObject) {
                 if (!model.threeObject.userData) {
                     model.threeObject.userData = {};
                 }
                 model.threeObject.userData.ignoreLimits = this.ignoreLimits;
             }
-        }
+        });
 
-        // Also pass model itself to dragControls
-        this.dragControls.model = model;
+        this.dragControls.onUpdateJoint = (joint, angle, sourceModel) => {
+            const model = sourceModel || this.currentModel;
+            if (!model) return;
 
-        this.dragControls.onUpdateJoint = (joint, angle) => {
-            // Check ignoreLimits flag (try getting from multiple locations, ensure reading latest value)
             const checkIgnoreLimits = this.ignoreLimits ||
-                                     (model && model.userData && model.userData.ignoreLimits) ||
-                                     (this.dragControls && this.dragControls.model &&
-                                      this.dragControls.model.userData &&
-                                      this.dragControls.model.userData.ignoreLimits);
+                                     (model.userData && model.userData.ignoreLimits) ||
+                                     (model.threeObject && model.threeObject.userData && model.threeObject.userData.ignoreLimits);
 
             if (!checkIgnoreLimits && joint.limits) {
                 angle = Math.max(joint.limits.lower, Math.min(joint.limits.upper, angle));
@@ -582,15 +693,12 @@ export class SceneManager {
             ModelLoaderFactory.setJointAngle(model, joint.name, angle);
             joint.currentValue = angle;
 
-            // Apply parallel mechanism constraints
             this.constraintManager.applyConstraints(model, joint);
 
-            // Update corresponding slider (if exists)
             const slider = document.querySelector(`input[data-joint="${joint.name}"]`);
             if (slider) {
                 slider.value = angle;
 
-                // Update input box
                 const valueInput = document.querySelector(`input[data-joint-input="${joint.name}"]`);
                 if (valueInput) {
                     const angleUnit = document.querySelector('#unit-deg.active') ? 'deg' : 'rad';
@@ -602,34 +710,33 @@ export class SceneManager {
                 }
             }
 
-            // Only render during drag, no complex calculations
             this.redraw();
 
-            // Trigger measurement update
             if (this.onMeasurementUpdate) {
                 this.onMeasurementUpdate();
             }
         };
 
-        // Hover highlight callback (handle immediately, like urdf-loaders)
         this.dragControls.onHover = (link) => {
             if (link) {
-                this.highlightManager.highlightLink(link, this.currentModel);
+                const m = this.dragControls.hoverModel || this.currentModel;
+                this.highlightManager.highlightLink(link, m);
             }
         };
 
         this.dragControls.onUnhover = (link) => {
             if (link) {
-                this.highlightManager.unhighlightLink(link, this.currentModel);
+                const m = this.dragControls.hoverModel || this.currentModel;
+                this.highlightManager.unhighlightLink(link, m);
             }
         };
 
         this.dragControls.onDragStart = (link) => {
             this.controls.enabled = false;
 
-            // If joint axes switch on, temporarily show only dragging joint's rotation axis
-            if (link && link.threeObject) {
-                // Find link's parent joint
+            const model = this.dragControls.hoverModel || this.currentModel;
+
+            if (link && link.threeObject && model) {
                 let currentLink = link.threeObject;
                 while (currentLink) {
                     const parentObject = currentLink.parent;
@@ -664,36 +771,35 @@ export class SceneManager {
     setIgnoreLimits(ignore) {
         this.ignoreLimits = ignore;
 
-        // Update model's userData (need to set in two locations)
-        if (this.currentModel) {
-            // Set on model object itself
-            if (!this.currentModel.userData) {
-                this.currentModel.userData = {};
-            }
-            this.currentModel.userData.ignoreLimits = ignore;
-
-            // Set on model's threeObject
-            if (this.currentModel.threeObject) {
-                if (!this.currentModel.threeObject.userData) {
-                    this.currentModel.threeObject.userData = {};
-                }
-                this.currentModel.threeObject.userData.ignoreLimits = ignore;
-            }
+        const all = [...this.getRobotModelsForDrag()];
+        if (this.meshOnlyModel) {
+            all.push(this.meshOnlyModel);
         }
 
-        // Update drag controls' model reference
-        if (this.dragControls && this.dragControls.model) {
-            if (!this.dragControls.model.userData) {
-                this.dragControls.model.userData = {};
+        all.forEach((model) => {
+            if (!model) return;
+            if (!model.userData) {
+                model.userData = {};
             }
-            this.dragControls.model.userData.ignoreLimits = ignore;
-
-            if (this.dragControls.model.threeObject) {
-                if (!this.dragControls.model.threeObject.userData) {
-                    this.dragControls.model.threeObject.userData = {};
+            model.userData.ignoreLimits = ignore;
+            if (model.threeObject) {
+                if (!model.threeObject.userData) {
+                    model.threeObject.userData = {};
                 }
-                this.dragControls.model.threeObject.userData.ignoreLimits = ignore;
+                model.threeObject.userData.ignoreLimits = ignore;
             }
+        });
+
+        if (this.dragControls && this.dragControls.models) {
+            this.dragControls.models.forEach((m) => {
+                if (!m) return;
+                if (!m.userData) m.userData = {};
+                m.userData.ignoreLimits = ignore;
+                if (m.threeObject) {
+                    if (!m.threeObject.userData) m.threeObject.userData = {};
+                    m.threeObject.userData.ignoreLimits = ignore;
+                }
+            });
         }
     }
 

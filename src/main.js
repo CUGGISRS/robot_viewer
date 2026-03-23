@@ -38,10 +38,60 @@ class App {
         this.usdViewerManager = null;
         this.mujocoSimulationManager = null;
         this.currentModel = null;
+        /** @type {Map<string, { model: object, file: File }>} sceneKey -> loaded robot (URDF/MJCF/XML) */
+        this.sceneModels = new Map();
+        this.activeSceneKey = null;
         this.currentMJCFFile = null;
         this.currentMJCFModel = null;
         this.angleUnit = 'rad';
         this.vscodeFileMap = new Map(); // Store VSCode files
+    }
+
+    /**
+     * Clear registry and all Three.js robot/mesh instances (new folder drop)
+     */
+    clearSceneModelsRegistry() {
+        if (this.sceneManager.meshOnlyModel) {
+            this.sceneManager.removeModel(this.sceneManager.meshOnlyModel);
+        }
+        this.sceneManager.clearAllRobotModels();
+        this.sceneModels.clear();
+        this.activeSceneKey = null;
+        this.currentModel = null;
+    }
+
+    /**
+     * Focus UI on an already-loaded file without reloading
+     */
+    switchToActiveSceneModel(sceneKey) {
+        const entry = this.sceneModels.get(sceneKey);
+        if (!entry) return;
+
+        this.currentModel = entry.model;
+        this.activeSceneKey = sceneKey;
+        this.fileHandler.currentModelFile = entry.file;
+
+        this.sceneManager.setActiveModel(entry.model, sceneKey);
+
+        this.jointControlsUI.setupJointControls(entry.model);
+        if (this.modelGraphView) {
+            this.modelGraphView.drawModelGraph(entry.model);
+        }
+        this.updateModelInfo(entry.model, entry.file);
+
+        const jointPanel = document.getElementById('joint-controls-panel');
+        const graphPanel = document.getElementById('graph-panel');
+        if (jointPanel) jointPanel.style.display = '';
+        if (graphPanel) graphPanel.style.display = '';
+
+        const editorPanel = document.getElementById('code-editor-panel');
+        if (editorPanel && editorPanel.classList.contains('visible') && this.codeEditorManager) {
+            this.codeEditorManager.loadFile(entry.file);
+        }
+
+        if (this.fileTreeView) {
+            this.fileTreeView.markActiveFile(entry.file);
+        }
     }
 
     /**
@@ -133,6 +183,7 @@ class App {
             });
 
             this.fileHandler.onFilesLoaded = (files) => {
+                this.clearSceneModelsRegistry();
                 if (this.fileTreeView) {
                     this.fileTreeView.updateFileTree(files, this.fileHandler.getFileMap());
                 }
@@ -297,6 +348,9 @@ class App {
         }
 
         if (isMJCF && model.joints && model.joints.size > 0) {
+            // MuJoCo scene is single-instance: remove other URDFs from the Three.js scene
+            this.clearSceneModelsRegistry();
+
             // Save model info for simulation
             this.currentMJCFFile = file;
             this.currentMJCFModel = model;
@@ -345,6 +399,8 @@ class App {
 
         // Check if USD WASM model
         if (model?.userData?.isUSDWASM) {
+            this.clearSceneModelsRegistry();
+
             // Hide Three.js canvas, show USD viewer
             const canvas = document.getElementById('canvas');
             const usdContainer = document.getElementById('usd-viewer-container');
@@ -395,10 +451,16 @@ class App {
         if (jointPanel) jointPanel.style.display = '';
         if (graphPanel) graphPanel.style.display = '';
 
-        // Clear old model
-        if (this.currentModel) {
-            this.sceneManager.removeModel(this.currentModel);
-            this.currentModel = null;
+        const sceneKey = this.fileHandler.getPathForFile(file);
+        if (!model.userData) {
+            model.userData = {};
+        }
+        model.userData.sceneKey = sceneKey;
+
+        if (!isMesh && this.sceneModels.has(sceneKey)) {
+            const prev = this.sceneModels.get(sceneKey);
+            this.sceneManager.removeModel(prev.model);
+            this.sceneModels.delete(sceneKey);
         }
 
         this.currentModel = model;
@@ -477,8 +539,18 @@ class App {
         };
         this.sceneManager.on('modelReady', onModelReady);
 
+        if (isMesh) {
+            this.sceneModels.clear();
+            this.activeSceneKey = null;
+        }
+
         // Add to scene (render in background under snapshot)
-        this.sceneManager.addModel(model);
+        this.sceneManager.addModel(model, { replace: false, sceneKey });
+
+        if (!isMesh) {
+            this.sceneModels.set(sceneKey, { model, file });
+            this.activeSceneKey = sceneKey;
+        }
 
         // Hide drop zone
         const dropZone = document.getElementById('drop-zone');
@@ -745,12 +817,21 @@ class App {
         const ext = fileInfo.ext;
         const modelExts = ['urdf', 'xacro', 'xml', 'usd', 'usda', 'usdc', 'usdz'];
         const meshExts = ['dae', 'stl', 'obj', 'collada'];
+        const sceneKey = this.fileHandler.getPathForFile(fileInfo.file);
+        const usdExts = ['usd', 'usda', 'usdc', 'usdz'];
 
         if (modelExts.includes(ext)) {
-            // Robot model file, load model and load into editor
+            if (!usdExts.includes(ext) && this.sceneModels.has(sceneKey)) {
+                this.switchToActiveSceneModel(sceneKey);
+                const editorPanel = document.getElementById('code-editor-panel');
+                if (editorPanel && editorPanel.classList.contains('visible') && this.codeEditorManager) {
+                    this.codeEditorManager.loadFile(fileInfo.file);
+                }
+                return;
+            }
+
             this.fileHandler.loadFile(fileInfo.file);
 
-            // If editor is open, auto-load file into editor
             const editorPanel = document.getElementById('code-editor-panel');
             if (editorPanel && editorPanel.classList.contains('visible') && this.codeEditorManager) {
                 this.codeEditorManager.loadFile(fileInfo.file);

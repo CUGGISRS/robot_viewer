@@ -19,6 +19,33 @@ export class VisualizationManager {
     }
 
     /**
+     * Per-instance key for link visibility (avoids duplicate link names across robots)
+     */
+    linkVisibilityKey(model, linkName) {
+        const sk = model?.userData?.sceneKey;
+        return sk ? `${sk}::${linkName}` : linkName;
+    }
+
+    /**
+     * Remove tracked meshes/colliders belonging to one model instance (multi-robot)
+     */
+    removeModelResources(model) {
+        if (!model?.threeObject) return;
+        const uuids = new Set();
+        model.threeObject.traverse((c) => uuids.add(c.uuid));
+        this.visualMeshes = this.visualMeshes.filter((m) => !uuids.has(m.uuid));
+        this.collisionMeshes = this.collisionMeshes.filter((m) => !uuids.has(m.uuid));
+        this.colliders = this.colliders.filter((c) => !uuids.has(c.uuid));
+        const sk = model.userData?.sceneKey;
+        if (sk) {
+            const prefix = `${sk}::`;
+            this.hiddenLinks = new Set(
+                [...this.hiddenLinks].filter((k) => !k.startsWith(prefix))
+            );
+        }
+    }
+
+    /**
      * Extract visual and collision meshes from model
      */
     extractVisualAndCollision(model) {
@@ -199,6 +226,14 @@ export class VisualizationManager {
     processNewlyLoadedMeshes(model) {
         if (!model.threeObject) return;
 
+        // Additional robot instances: register collider roots (first load only filled colliders for model 1)
+        model.threeObject.traverse((child) => {
+            if (child.isURDFCollider && !this.colliders.includes(child)) {
+                this.colliders.push(child);
+                child.visible = this.showCollision;
+            }
+        });
+
         // First pass: Process materials for visual meshes only (skip collision meshes)
         model.threeObject.traverse((child) => {
             if (child.isMesh && child.material) {
@@ -376,7 +411,7 @@ export class VisualizationManager {
             currentModel.links.forEach((link, linkName) => {
                 if (link.threeObject) {
                     // If link is individually hidden, keep it hidden; otherwise follow global setting
-                    const shouldBeVisible = show && !this.hiddenLinks.has(linkName);
+                    const shouldBeVisible = show && !this.hiddenLinks.has(this.linkVisibilityKey(currentModel, linkName));
                     this.setLinkVisibility(link.threeObject, shouldBeVisible, currentModel);
                 }
             });
@@ -714,12 +749,13 @@ export class VisualizationManager {
             return false;
         }
 
+        const visKey = this.linkVisibilityKey(currentModel, linkName);
         // Toggle hidden state
-        const isHidden = this.hiddenLinks.has(linkName);
+        const isHidden = this.hiddenLinks.has(visKey);
         if (isHidden) {
-            this.hiddenLinks.delete(linkName);
+            this.hiddenLinks.delete(visKey);
         } else {
-            this.hiddenLinks.add(linkName);
+            this.hiddenLinks.add(visKey);
         }
 
         const newVisibility = !isHidden ? false : true;
@@ -732,8 +768,11 @@ export class VisualizationManager {
     /**
      * Check if link is hidden
      */
-    isLinkHidden(linkName) {
-        return this.hiddenLinks.has(linkName);
+    isLinkHidden(linkName, currentModel = null) {
+        const visKey = currentModel
+            ? this.linkVisibilityKey(currentModel, linkName)
+            : linkName;
+        return this.hiddenLinks.has(visKey);
     }
 
     /**

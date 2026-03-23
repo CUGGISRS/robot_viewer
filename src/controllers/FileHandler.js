@@ -532,6 +532,26 @@ export class FileHandler {
     }
 
     /**
+     * Resolve stable path key for a File (same logic as loadFile fullPath)
+     * @param {File} file
+     * @returns {string}
+     */
+    getPathForFile(file) {
+        if (!file) return '';
+        let fullPath = file.name;
+        for (const [path, f] of this.fileMap.entries()) {
+            if (f === file) {
+                fullPath = path;
+                break;
+            }
+        }
+        if (file.vscodePath) {
+            fullPath = file.vscodePath;
+        }
+        return fullPath;
+    }
+
+    /**
      * Get file map
      */
     getFileMap() {

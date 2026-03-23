@@ -15,13 +15,14 @@ export class ConstraintManager {
      * Visualize parallel mechanism constraints
      */
     visualizeConstraints(model, world) {
-        // Clean up previous constraint visualizations
-        this.constraintVisuals.forEach(visual => {
-            if (visual.parent) {
-                visual.parent.remove(visual);
+        const sk = model.userData?.sceneKey ?? '_default';
+        this.constraintVisuals = this.constraintVisuals.filter((visual) => {
+            if (visual.userData.modelSceneKey === sk) {
+                if (visual.parent) visual.parent.remove(visual);
+                return false;
             }
+            return true;
         });
-        this.constraintVisuals = [];
 
         if (!model.constraints || model.constraints.size === 0) {
             return; // No constraints, skip
@@ -86,6 +87,7 @@ export class ConstraintManager {
         line.userData.body1 = body1;
         line.userData.body2 = body2;
         line.userData.isConstraintVisualization = true;
+        line.userData.modelSceneKey = model.userData?.sceneKey ?? '_default';
 
         // Add to scene (add to world or scene)
         const parent = world || this.sceneManager.scene;
@@ -165,6 +167,7 @@ export class ConstraintManager {
         line.userData.link1 = link1;
         line.userData.link2 = link2;
         line.userData.isConstraintVisualization = true;
+        line.userData.modelSceneKey = model.userData?.sceneKey ?? '_default';
 
         const parent = world || this.sceneManager.scene;
         parent.add(line);
@@ -231,6 +234,7 @@ export class ConstraintManager {
         line.userData.body1 = body1;
         line.userData.body2 = body2;
         line.userData.isConstraintVisualization = true;
+        line.userData.modelSceneKey = model.userData?.sceneKey ?? '_default';
 
         const parent = world || this.sceneManager.scene;
         parent.add(line);
@@ -442,6 +446,20 @@ export class ConstraintManager {
             if (visual.parent) visual.parent.remove(visual);
         });
         this.constraintVisuals = [];
+    }
+
+    /**
+     * Remove constraint visuals for one robot instance
+     */
+    removeConstraintsForModel(model) {
+        const sk = model.userData?.sceneKey ?? '_default';
+        this.constraintVisuals = this.constraintVisuals.filter((visual) => {
+            if (visual.userData.modelSceneKey === sk) {
+                if (visual.parent) visual.parent.remove(visual);
+                return false;
+            }
+            return true;
+        });
     }
 }
 

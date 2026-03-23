@@ -157,8 +157,9 @@ export class CoordinateAxesManager {
 
     /**
      * Create coordinate axes for a link
+     * @param {string} instancePrefix - Unique per robot instance (e.g. sceneKey + "::") to avoid name collisions
      */
-    createLinkAxes(link, linkName, modelSize = 1.0) {
+    createLinkAxes(link, linkName, modelSize = 1.0, instancePrefix = '') {
         // Calculate actual size of current link
         let linkSize = modelSize; // Default use entire model size
 
@@ -231,8 +232,9 @@ export class CoordinateAxesManager {
             link.threeObject.add(axesGroup);
         }
 
+        const mapKey = instancePrefix ? `${instancePrefix}${linkName}` : linkName;
         // Save reference
-        this.linkAxesHelpers.set(linkName, axesGroup);
+        this.linkAxesHelpers.set(mapKey, axesGroup);
 
         // Decide whether to show based on current setting
         axesGroup.visible = this.showAxesEnabled;
@@ -243,7 +245,7 @@ export class CoordinateAxesManager {
     /**
      * Create joint axis visualization (large red arrow)
      */
-    createJointAxis(joint, jointName) {
+    createJointAxis(joint, jointName, instancePrefix = '') {
         if (!joint.threeObject || (joint.type !== 'revolute' && joint.type !== 'continuous')) {
             return null; // Only create axis for revolute joints
         }
@@ -307,8 +309,9 @@ export class CoordinateAxesManager {
         const rotationIndicator = this.createRotationIndicator(localAxisDirection, arrowLength);
         axisGroup.add(rotationIndicator);
 
+        const mapKey = instancePrefix ? `${instancePrefix}${jointName}` : jointName;
         // Save reference (but don't add to scene yet)
-        this.jointAxesHelpers.set(jointName, {
+        this.jointAxesHelpers.set(mapKey, {
             mesh: axisGroup,
             parent: jointObject,  // Add to joint object so it follows joint movement
             joint: joint,
@@ -318,7 +321,7 @@ export class CoordinateAxesManager {
         // Decide whether to add to scene based on current setting
         if (this.showJointAxesEnabled) {
             jointObject.add(axisGroup);
-            this.jointAxesHelpers.get(jointName).isAttached = true;
+            this.jointAxesHelpers.get(mapKey).isAttached = true;
         }
         return axisGroup;
     }
@@ -541,6 +544,41 @@ export class CoordinateAxesManager {
     clear() {
         this.clearAllLinkAxes();
         this.clearAllJointAxes();
+    }
+
+    /**
+     * Remove link/joint axes for one robot instance (multi-model)
+     * @param {string} instancePrefix - Same prefix passed to createLinkAxes / createJointAxis
+     */
+    removeInstanceAxes(instancePrefix) {
+        if (!instancePrefix) {
+            return;
+        }
+        const toRemoveLink = [];
+        this.linkAxesHelpers.forEach((axes, key) => {
+            if (key.startsWith(instancePrefix)) {
+                toRemoveLink.push(key);
+            }
+        });
+        toRemoveLink.forEach((key) => {
+            const axes = this.linkAxesHelpers.get(key);
+            if (axes?.parent) axes.parent.remove(axes);
+            this.linkAxesHelpers.delete(key);
+        });
+
+        const toRemoveJoint = [];
+        this.jointAxesHelpers.forEach((axisInfo, key) => {
+            if (key.startsWith(instancePrefix)) {
+                toRemoveJoint.push(key);
+            }
+        });
+        toRemoveJoint.forEach((key) => {
+            const axisInfo = this.jointAxesHelpers.get(key);
+            if (axisInfo?.isAttached && axisInfo.parent && axisInfo.mesh) {
+                axisInfo.parent.remove(axisInfo.mesh);
+            }
+            this.jointAxesHelpers.delete(key);
+        });
     }
 }
 

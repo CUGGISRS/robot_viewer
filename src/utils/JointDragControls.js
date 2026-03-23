@@ -114,7 +114,12 @@ export class JointDragControls {
         this.scene = scene;
         this.camera = camera;
         this.domElement = domElement;
-        this.model = model;
+        /** @type {import('../models/UnifiedRobotModel.js').UnifiedRobotModel[]} */
+        this.models = Array.isArray(model) ? model.filter(Boolean) : (model ? [model] : []);
+        this.model = this.models[0] || null;
+        /** Model under cursor (multi-robot) or joint being dragged */
+        this.hoverModel = null;
+        this.dragJointModel = null;
         this.raycaster = new THREE.Raycaster();
         // Allow raycasting to detect invisible objects (for when visual is hidden)
         this.raycaster.layers.enableAll();
@@ -125,21 +130,14 @@ export class JointDragControls {
         this.renderer = null;
     }
 
-    update() {
-        const { raycaster, hovered, manipulating } = this;
-        const model = this.model;
-
-        if (manipulating || !this.enabled || !model || !model.threeObject) {
-            return;
-        }
-
-        let hoveredLink = null;
-
-        // Temporarily store and enable visibility for visual meshes to allow raycasting
+    /**
+     * @param {THREE.Raycaster} raycaster
+     * @param {import('../models/UnifiedRobotModel.js').UnifiedRobotModel} model
+     */
+    _intersectModelForHover(raycaster, model) {
         const hiddenMeshes = [];
         model.threeObject.traverse((child) => {
             if (child.isMesh && !child.visible) {
-                // Check if it's a visual mesh (not collision)
                 let isInCollider = false;
                 let checkNode = child;
                 while (checkNode) {
@@ -156,22 +154,17 @@ export class JointDragControls {
             }
         });
 
-        // Only detect robot model, not entire scene
         const intersections = raycaster.intersectObject(model.threeObject, true);
 
-        // Restore visibility
         hiddenMeshes.forEach(mesh => {
             mesh.visible = false;
         });
 
-        // Filter out collision meshes (but allow invisible visual meshes for interaction)
         const validIntersections = intersections.filter(intersect => {
             const obj = intersect.object;
-            // Skip collision meshes
             if (obj.isURDFCollider || obj.userData?.isCollision || obj.userData?.isCollisionGeom) {
                 return false;
             }
-            // Check if object is in collision hierarchy
             let isInCollider = false;
             let checkNode = obj;
             while (checkNode) {
@@ -184,44 +177,80 @@ export class JointDragControls {
             if (isInCollider) {
                 return false;
             }
-            // Allow all visual meshes
             return obj.isMesh;
         });
 
-        // Like urdf-loaders, only detect first intersecting object (closest)
-        if (validIntersections.length !== 0) {
-            const hit = validIntersections[0];
-            hoveredLink = findParentLink(hit.object, model);
+        if (validIntersections.length === 0) {
+            return null;
+        }
+        return validIntersections[0];
+    }
 
-            if (hoveredLink) {
-                this.hitDistance = hit.distance;
-                this.initialGrabPoint.copy(hit.point);
+    update() {
+        const { raycaster, hovered, manipulating } = this;
+
+        if (manipulating || !this.enabled) {
+            return;
+        }
+
+        const models = this.models && this.models.length > 0 ? this.models : (this.model ? [this.model] : []);
+        if (models.length === 0) {
+            return;
+        }
+
+        let hoveredLink = null;
+        let pickModel = null;
+        let bestHit = null;
+        let bestDist = Infinity;
+
+        for (const model of models) {
+            if (!model?.threeObject) continue;
+            const hit = this._intersectModelForHover(raycaster, model);
+            if (hit && hit.distance < bestDist) {
+                bestDist = hit.distance;
+                bestHit = hit;
+                pickModel = model;
             }
         }
 
-        // Only trigger callback when hovered object actually changes (avoid duplicate highlighting)
-        // Use name comparison because findParentLink returns new object each time
-        const hoveredName = hoveredLink?.name || null;
-        const currentHoveredName = hovered?.name || null;
+        this.hoverModel = pickModel;
 
-        if (hoveredName !== currentHoveredName) {
+        if (bestHit && pickModel) {
+            hoveredLink = findParentLink(bestHit.object, pickModel);
+
+            if (hoveredLink) {
+                this.hitDistance = bestHit.distance;
+                this.initialGrabPoint.copy(bestHit.point);
+            }
+        }
+
+        // Include sceneKey so duplicate link names across robots trigger hover change
+        const keyA = hoveredLink && pickModel
+            ? `${pickModel.userData?.sceneKey || ''}::${hoveredLink.name}`
+            : null;
+        const keyB = hovered && this._lastHoverPickModel
+            ? `${this._lastHoverPickModel.userData?.sceneKey || ''}::${hovered.name}`
+            : null;
+
+        if (keyA !== keyB) {
             if (hovered) {
                 this.onUnhover(hovered);
             }
             this.hovered = hoveredLink;
+            this._lastHoverPickModel = pickModel;
             if (hoveredLink) {
                 this.onHover(hoveredLink);
             }
         } else if (hoveredLink && hovered) {
-            // Even for same link, update object reference (keep latest object)
             this.hovered = hoveredLink;
+            this._lastHoverPickModel = pickModel;
         }
     }
 
     updateJoint(joint, angle) {
-        // joint is unified model Joint object, need to update via onUpdateJoint callback
         if (this.onUpdateJoint) {
-            this.onUpdateJoint(joint, angle);
+            const sourceModel = this.dragJointModel || this.model;
+            this.onUpdateJoint(joint, angle, sourceModel);
         }
     }
 
@@ -364,7 +393,8 @@ export class JointDragControls {
 
                 // Apply limits
                 if (manipulating.limits) {
-                    const ignoreLimits = this.model?.userData?.ignoreLimits || this.model?.threeObject?.userData?.ignoreLimits || false;
+                    const limModel = this.dragJointModel || this.model;
+                    const ignoreLimits = limModel?.userData?.ignoreLimits || limModel?.threeObject?.userData?.ignoreLimits || false;
                     if (!ignoreLimits) {
                         newAngle = Math.max(manipulating.limits.lower, Math.min(manipulating.limits.upper, newAngle));
                     }
@@ -386,17 +416,16 @@ export class JointDragControls {
                 return;
             }
 
-            // hovered is now a link object, need to find its parent joint for dragging
-            const parentJoint = findParentJoint(hovered, this.model);
+            const pickModel = this.hoverModel || this.models[0] || this.model;
+            const parentJoint = findParentJoint(hovered, pickModel);
 
             if (parentJoint) {
-                // Has parent joint, can drag to rotate
+                this.dragJointModel = pickModel;
                 this.manipulating = parentJoint;
-                this.manipulatingLink = hovered; // Save the link being manipulated
-                this.onDragStart(hovered);  // Callback passes link
+                this.manipulatingLink = hovered;
+                this.onDragStart(hovered);
             } else {
-                // No parent joint (base link or fixed link), cannot drag, but still trigger event
-                // This disables orbit controller to avoid conflicts
+                this.dragJointModel = pickModel;
                 this.manipulatingLink = hovered;
                 this.onDragStart(hovered);
             }
@@ -407,6 +436,7 @@ export class JointDragControls {
             this.onDragEnd(this.manipulatingLink || hovered);  // Callback passes link
             this.manipulating = null;
             this.manipulatingLink = null;
+            this.dragJointModel = null;
             this.update();
         }
     }
@@ -437,70 +467,35 @@ export class PointerJointDragControls extends JointDragControls {
             updateMouse(e);
             raycaster.setFromCamera(mouse, this.camera);
 
-            // Only grab if actually clicking on the model
-            // Check if ray intersects with the model before disabling camera controls
-            if (!this.model || !this.model.threeObject) return;
+            const models = this.models && this.models.length > 0 ? this.models : (this.model ? [this.model] : []);
+            if (models.length === 0) return;
 
-            // Temporarily store and enable visibility for visual meshes to allow raycasting
-            const hiddenMeshes = [];
-            this.model.threeObject.traverse((child) => {
-                if (child.isMesh && !child.visible) {
-                    // Check if it's a visual mesh (not collision)
-                    let isInCollider = false;
-                    let checkNode = child;
-                    while (checkNode) {
-                        if (checkNode.isURDFCollider) {
-                            isInCollider = true;
-                            break;
-                        }
-                        checkNode = checkNode.parent;
-                    }
-                    if (!isInCollider) {
-                        child.visible = true;
-                        hiddenMeshes.push(child);
-                    }
+            let bestHit = null;
+            let pickModel = null;
+            let bestDist = Infinity;
+
+            for (const model of models) {
+                if (!model?.threeObject) continue;
+                const hit = this._intersectModelForHover(raycaster, model);
+                if (hit && hit.distance < bestDist) {
+                    bestDist = hit.distance;
+                    bestHit = hit;
+                    pickModel = model;
                 }
-            });
+            }
 
-            const intersections = raycaster.intersectObject(this.model.threeObject, true);
+            this.hoverModel = pickModel;
 
-            // Restore visibility
-            hiddenMeshes.forEach(mesh => {
-                mesh.visible = false;
-            });
+            const hitLink = bestHit && pickModel
+                ? findParentLink(bestHit.object, pickModel)
+                : null;
 
-            // Filter out collision meshes (but allow invisible visual meshes for interaction)
-            const validIntersections = intersections.filter(intersect => {
-                const obj = intersect.object;
-                // Skip collision meshes
-                if (obj.isURDFCollider || obj.userData?.isCollision || obj.userData?.isCollisionGeom) {
-                    return false;
-                }
-                // Check if object is in collision hierarchy
-                let isInCollider = false;
-                let checkNode = obj;
-                while (checkNode) {
-                    if (checkNode.isURDFCollider) {
-                        isInCollider = true;
-                        break;
-                    }
-                    checkNode = checkNode.parent;
-                }
-                if (isInCollider) {
-                    return false;
-                }
-                // Allow all visual meshes
-                return obj.isMesh;
-            });
-
-            const hitLink = validIntersections.length > 0 ? findParentLink(validIntersections[0].object, this.model) : null;
-
-            // Only set grabbed if we actually hit a visible link
             if (hitLink) {
+                this.hitDistance = bestHit.distance;
+                this.initialGrabPoint.copy(bestHit.point);
                 this.moveRay(raycaster.ray);
                 this.setGrabbed(true);
             }
-            // If not hitting model, don't grab - allow camera controls to work
         };
 
         this._mouseMove = e => {

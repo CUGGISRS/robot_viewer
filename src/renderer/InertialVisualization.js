@@ -64,22 +64,47 @@ export class InertialVisualization {
     }
 
     /**
+     * Remove COM/inertia visuals for one model instance (scene graph removal)
+     */
+    removeModelInertial(model) {
+        if (!model) return;
+        const sk = model.userData?.sceneKey ?? '_default';
+        this.comMarkers = this.comMarkers.filter((marker) => {
+            if (marker.userData.sceneKey === sk) {
+                if (marker.parent) marker.parent.remove(marker);
+                return false;
+            }
+            return true;
+        });
+        this.inertiaEllipsoids = this.inertiaEllipsoids.filter((ellipsoid) => {
+            if (ellipsoid.userData.sceneKey === sk) {
+                if (ellipsoid.parent) ellipsoid.parent.remove(ellipsoid);
+                return false;
+            }
+            return true;
+        });
+    }
+
+    /**
      * Extract and visualize inertial properties from model
      */
     extractInertialProperties(model) {
-        // Clean up: remove from parent objects
-        this.comMarkers.forEach(marker => {
-            if (marker.parent) {
-                marker.parent.remove(marker);
+        const sk = model.userData?.sceneKey ?? '_default';
+        // Re-extract for this instance only; keep other robots' markers
+        this.comMarkers = this.comMarkers.filter((marker) => {
+            if (marker.userData.sceneKey === sk) {
+                if (marker.parent) marker.parent.remove(marker);
+                return false;
             }
+            return true;
         });
-        this.inertiaEllipsoids.forEach(ellipsoid => {
-            if (ellipsoid.parent) {
-                ellipsoid.parent.remove(ellipsoid);
+        this.inertiaEllipsoids = this.inertiaEllipsoids.filter((ellipsoid) => {
+            if (ellipsoid.userData?.sceneKey === sk) {
+                if (ellipsoid.parent) ellipsoid.parent.remove(ellipsoid);
+                return false;
             }
+            return true;
         });
-        this.comMarkers = [];
-        this.inertiaEllipsoids = [];
 
         if (!model.links) {
             return;
@@ -226,6 +251,7 @@ export class InertialVisualization {
 
         // Mark this as center of mass
         comGroup.userData.isCenterOfMass = true;
+        comGroup.userData.sceneKey = model.userData?.sceneKey ?? '_default';
 
         comGroup.position.copy(position);
         comGroup.visible = this.showCOM;
@@ -329,6 +355,7 @@ export class InertialVisualization {
         // Allow raycasting so inertia box can be selected for dragging
         // Mark as inertia box
         inertiaBox.userData.isInertiaBox = true;
+        inertiaBox.userData.sceneKey = model.userData?.sceneKey ?? '_default';
 
         const linkObject = this.findLinkObject(model.threeObject, link.name);
         if (linkObject) {
@@ -359,12 +386,12 @@ export class InertialVisualization {
     toggleCenterOfMass(show, currentModel) {
         this.showCOM = show;
 
-        if (show && this.comMarkers.length === 0 && currentModel) {
-            // If enabling and not yet created, need to recreate
+        const sk = currentModel?.userData?.sceneKey ?? '_default';
+        const hasForModel = this.comMarkers.some((m) => m.userData.sceneKey === sk);
+        if (show && currentModel && !hasForModel) {
             this.extractInertialProperties(currentModel);
         } else {
-            // Otherwise just toggle visibility
-            this.comMarkers.forEach(marker => {
+            this.comMarkers.forEach((marker) => {
                 marker.visible = show;
             });
         }
@@ -376,12 +403,12 @@ export class InertialVisualization {
     toggleInertia(show, currentModel) {
         this.showInertia = show;
 
-        if (show && this.inertiaEllipsoids.length === 0 && currentModel) {
-            // If enabling and not yet created, need to recreate
+        const sk = currentModel?.userData?.sceneKey ?? '_default';
+        const hasForModel = this.inertiaEllipsoids.some((e) => e.userData.sceneKey === sk);
+        if (show && currentModel && !hasForModel) {
             this.extractInertialProperties(currentModel);
         } else {
-            // Otherwise just toggle visibility
-            this.inertiaEllipsoids.forEach(ellipsoid => {
+            this.inertiaEllipsoids.forEach((ellipsoid) => {
                 ellipsoid.visible = show;
             });
         }
